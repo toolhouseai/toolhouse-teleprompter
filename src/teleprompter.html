@@ -364,12 +364,14 @@
       let scriptWords = [];      // original words (display form)
       let normalizedWords = [];  // lowercase, no punctuation (for matching)
       let wordSpans = [];        // DOM span elements
-      let pointer = 0;           // current position in script
+      let sentences = [];        // array of { startIdx, endIdx, words[] (normalized) }
+      let currentSentence = 0;   // index into sentences[]
+      let pointer = 0;           // word-level pointer for highlighting (points to first word of current sentence)
       let recognition = null;
       let isListening = false;
       let isPaused = false;
 
-      const LOOK_AHEAD = 30;     // how far ahead to search for matches
+      const MATCH_THRESHOLD = 0.5; // 50% of sentence words must match to advance
 
       // ── Check browser support ──
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -390,9 +392,9 @@
         startBtn.disabled = false;
       }
 
-      // ── Normalize a word for matching ──
+      // ── Normalize a word for matching (strip ALL punctuation) ──
       function normalize(word) {
-        return word.toLowerCase().replace(/[^a-z0-9'-]/g, '');
+        return word.toLowerCase().replace(/[^a-z0-9]/g, '');
       }
 
       // ── Levenshtein distance for fuzzy matching ──
@@ -430,8 +432,29 @@
 
       // ── Tokenize script into words ──
       function tokenizeScript(text) {
-        // Split on whitespace, preserving each word
         return text.split(/\s+/).filter(w => w.length > 0);
+      }
+
+      // ── Split script into sentences ──
+      // Each sentence maps to a range of indices in the flat word list.
+      function buildSentences(text, normalizedWords) {
+        const sentenceTexts = text.split(/(?<=[.!?])\s+|(?:\r?\n){2,}/);
+        const result = [];
+        let wordIdx = 0;
+
+        for (const sentenceText of sentenceTexts) {
+          const wordsInSentence = sentenceText.split(/\s+/).filter(w => w.length > 0);
+          if (wordsInSentence.length === 0) continue;
+
+          const startIdx = wordIdx;
+          const endIdx = wordIdx + wordsInSentence.length - 1;
+          const words = normalizedWords.slice(startIdx, endIdx + 1).filter(w => w.length > 0);
+
+          result.push({ startIdx, endIdx, words });
+          wordIdx += wordsInSentence.length;
+        }
+
+        return result;
       }
 
       // ── Render script words as spans ──
@@ -457,24 +480,33 @@
         updateHighlight();
       }
 
-      // ── Update word highlighting based on pointer ──
+      // ── Update word highlighting based on current sentence ──
       function updateHighlight() {
+        const sent = sentences[currentSentence];
         wordSpans.forEach((span, i) => {
           span.classList.remove('spoken', 'active');
-          if (i < pointer) {
+          if (sent && i < sent.startIdx) {
             span.classList.add('spoken');
-          } else if (i === pointer) {
+          } else if (sent && i >= sent.startIdx && i <= sent.endIdx) {
             span.classList.add('active');
           }
         });
+        // If we're past all sentences, dim everything
+        if (currentSentence >= sentences.length) {
+          wordSpans.forEach(span => {
+            span.classList.remove('active');
+            span.classList.add('spoken');
+          });
+        }
       }
 
-      // ── Scroll to keep active word visible ──
+      // ── Scroll to keep active sentence visible ──
       let scrollRAF = null;
       function scrollToActive() {
         if (scrollRAF) cancelAnimationFrame(scrollRAF);
         scrollRAF = requestAnimationFrame(() => {
-          const activeSpan = wordSpans[pointer];
+          const sent = sentences[currentSentence];
+          const activeSpan = sent ? wordSpans[sent.startIdx] : null;
           if (!activeSpan) return;
 
           const container = scriptDisplay;
@@ -489,8 +521,27 @@
         });
       }
 
-      // ── Process incoming transcribed words ──
+      // ── Check if spoken words match the current sentence ──
+      function computeMatchRatio(spokenWords, sentence) {
+        if (!sentence || sentence.words.length === 0) return 0;
+
+        const matched = new Set();
+        for (const spoken of spokenWords) {
+          for (let i = 0; i < sentence.words.length; i++) {
+            if (!matched.has(i) && isMatch(spoken, sentence.words[i])) {
+              matched.add(i);
+              break;
+            }
+          }
+        }
+
+        return matched.size / sentence.words.length;
+      }
+
+      // ── Process incoming transcribed words against current sentence ──
       function processTranscription(transcript) {
+        if (currentSentence >= sentences.length) return;
+
         const spokenWords = transcript
           .split(/\s+/)
           .map(normalize)
@@ -500,23 +551,15 @@
 
         let advanced = false;
 
-        for (const spoken of spokenWords) {
-          // Search forward from pointer within look-ahead window
-          const searchEnd = Math.min(pointer + LOOK_AHEAD, normalizedWords.length);
+        // Check current sentence and potentially the next one (if speaker is ahead)
+        while (currentSentence < sentences.length) {
+          const ratio = computeMatchRatio(spokenWords, sentences[currentSentence]);
 
-          let bestIdx = -1;
-
-          for (let i = pointer; i < searchEnd; i++) {
-            if (isMatch(spoken, normalizedWords[i])) {
-              bestIdx = i;
-              break; // take the nearest forward match
-            }
-          }
-
-          if (bestIdx >= 0) {
-            // Advance pointer past the matched word
-            pointer = bestIdx + 1;
+          if (ratio >= MATCH_THRESHOLD) {
+            currentSentence++;
             advanced = true;
+          } else {
+            break;
           }
         }
 
@@ -525,8 +568,7 @@
           scrollToActive();
         }
 
-        // Check if we've reached the end
-        if (pointer >= scriptWords.length) {
+        if (currentSentence >= sentences.length) {
           setStatus('Complete!', false);
         }
       }
@@ -539,25 +581,18 @@
         rec.lang = 'en-US';
         rec.maxAlternatives = 1;
 
-        let finalTranscriptBuffer = '';
-
         rec.onresult = (event) => {
           if (isPaused) return;
 
-          let interim = '';
+          // Collect the full transcript from this recognition session
+          let fullTranscript = '';
 
           for (let i = event.resultIndex; i < event.results.length; i++) {
-            const result = event.results[i];
-            if (result.isFinal) {
-              processTranscription(result[0].transcript);
-            } else {
-              interim += result[0].transcript;
-            }
+            fullTranscript += event.results[i][0].transcript;
           }
 
-          // Also process interim results for responsiveness
-          if (interim) {
-            processTranscription(interim);
+          if (fullTranscript) {
+            processTranscription(fullTranscript);
           }
         };
 
@@ -604,6 +639,8 @@
         // Tokenize
         scriptWords = tokenizeScript(text);
         normalizedWords = scriptWords.map(normalize);
+        sentences = buildSentences(text, normalizedWords);
+        currentSentence = 0;
         pointer = 0;
 
         // Switch screens
